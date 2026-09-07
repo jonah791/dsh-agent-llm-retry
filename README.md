@@ -10,6 +10,12 @@
 -->
 # dsh-agent-llm-retry
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-llm-retry"><img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 模型请求自动多次重试：在 agent/request-error 扩展点把 retryPolicy 升级为 maxRetries 20（默认），配合官方 llm-retry 执行器实现指数退避重试
 
 ## 生态
