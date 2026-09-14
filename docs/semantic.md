@@ -108,14 +108,18 @@ agent/status(idle) → sessionProjections.snapshot(agent.session).values.tokenUs
 |---|-----------|----------------------------------------|------|
 | 1 | 插件在 web profile 装载并注册了 4 个工具 | 本会话工具面存在 `llm_retry_status`（实际调用可见）；组合行 `.dsh/profiles/web/cordis.patch.yml:137-146` | 已验证（工具可调用） |
 | 2 | 策略升级后的生效值 = 配置值 20 | `llm_retry_status` 返回 `config.maxRetries === 20`、`providers[].upgraded.maxRetries === 20` | 已验证（工具可调用） |
-| 3 | 升级分支真的改写了 payload | 需新增单测：构造 `payload.retryPolicy={mode:'normal',maxRetries:5|2,…}` → 断言监听器返回 `next()` 且 `payload.retryPolicy.maxRetries===20` | 待验收（无单测） |
-| 4 | `mode:'always'` 与 `maxRetries>=config` 两个分支不改写、无 `retryPolicy` 时注入兜底 | 需新增单测三条（always / 已达 / undefined → 断言 `DEFAULT_RETRYABLE_CODES` + `maxRetries=20`） | 待验收 |
-| 5 | 监听器无条件放行（不短路官方执行器） | 单测断言 `next()` 被调用且返回值被透传 | 待验收 |
+| 3 | 升级分支真的改写 payload（决策层） | `npm test` → `tests/policy.test.mjs` 的 `decidePolicyUpgrade: 正常路径…` 断言 `{action:'upgrade', fromMaxRetries:2, policy.maxRetries:20, 保留原 codes}`；**接线层**（写回 payload + 放行）由 `tests/contract.test.mjs` 不变量①静态守卫 | 已验收（决策层单测 + 接线层静态守卫；**未**做 ctx 级集成测试，见 §10 第 10 条） |
+| 4 | `mode:'always'` / `maxRetries>=config` 不改写；无 `retryPolicy` 时注入兜底 | `npm test` → policy 套件：`无策略（undefined/null）→ 注入默认策略（官方默认码）`、`always 模式 / 未知 mode 一律 noop`、`不降级——maxRetries 等于/大于配置一律 noop` | 已验收（2026-09-14，单测） |
+| 5 | 监听器无条件放行（不短路官方执行器） | `npm test` → `tests/contract.test.mjs` 不变量①：断言回调体**末条语句**是 `return next()`；尸体样本（把 next() 塞进 if）被判 false | 已验收（2026-09-14，静态守卫 + 尸体样本） |
 | 6 | 预算追踪在当前 web 组合下不运行 | `cordis.patch.yml:140` `budgetEnabled: false`；`.dsh/token-budget.json` `updatedAt = 2026-08-21T04:27:35.657Z`（此后无增长） | 已验证（落盘产物） |
-| 7 | `token_budget_set` 后开始记账并开新周期 | 调用 `token_budget_set` → 断言返回 `cycle` 递增、`.dsh/token-budget.json` `cycleStartedAt` 更新 | 待验收 |
-| 8 | 达档位时累计清零并开新周期；同快照重复触发不重复累加 | 单测两条：spent ≥ 最高档 → 断言 `reminded` 含该档位、`sessions/baseline` 清空、`cycle+1`；同 `usageTotal` 连续两次 `record` → 累计不变 | 待验收 |
-| 9 | 线上跑的构建 ≥ 源码最近一次改动 | `lib/index.js` mtime `2026-08-21 12:29:49` ≥ `src/index.ts` mtime `2026-08-21 12:29:19` | 已验证（文件 mtime） |
+| 7 | `token_budget_set` 后开始记账并开新周期 | 调用 `token_budget_set` → 断言返回 `cycle` 递增、`.dsh/token-budget.json` `cycleStartedAt` 更新 | 待验收（需线上调用；纯逻辑侧已由 `effectiveBudget`/`cycleResetDue` 单测覆盖） |
+| 8 | 达档位时累计清零并开新周期；同快照重复触发不重复累加 | `npm test` → `dueReminders`（已提醒去重 / 非正档位跳过 / 阈值取整边界）+ `cycleResetDue`（最高档达成才清零） | 已验收（2026-09-14，单测；`startNewCycle` 的清零动作在接线层未做 ctx 集成） |
+| 9 | 线上跑的构建 ≥ 源码最近一次改动 | `lib/index.js` mtime `2026-08-21 12:29:49` ≥ `src/index.ts` mtime `2026-08-21 12:29:19` | 已验证（文件 mtime，本次改动后需重新构建部署，见 §8 生效判据） |
 | 10 | 官方执行器在 web 生效组合内（= 本插件升级有真实下游消费者） | `deepseek-harness/packages/bundle/base/cordis.patch.yml:84-85`（`- id: llm-retry` / `name: '@deepseek-ai/dsh-llm-retry'`）+ `.dsh/profiles/web/package.json` 的 `dsh` 依赖含 `@deepseek-ai/dsh-base` | 已验证（静态取证 2026-09-14） |
+| 11 | 失败/退化路径被机器锁住（体检器 S6 判据） | `npm test` → 36/36 pass：畸形策略对象 / 非数值 `maxRetries`（`'2'`/`null`/`NaN`/`Infinity`）/ 空或非数组 `retryableCodes` / 损坏 state（数组、字符串、字段畸形）/ 缺快照 / 除零 / 阈值取整边界 / 幂等 | 已实测（2026-09-14，`node --test "tests/*.test.mjs"`） |
+| 12 | 决策逻辑与 IO 分离（可离线单测） | `src/retry-pure.ts`、`src/budget-pure.ts` 不引 `node:fs`/`node:child_process`，不收 `ctx`（`grep -E "node:fs\\|ctx\\." src/*-pure.ts` 零命中） | 已实测（2026-09-14） |
+| 13 | 提醒文案与**生效预算**同源（修前不一致） | `npm test` → `tests/contract.test.mjs` 不变量②：`remindText` 第三参不得出现 `config.budgetTokens`；尸体样本（修前那一行）必被抓出 | 已实测（2026-09-14） |
+| 14 | 损坏的 `token-budget.json` 不崩且逐条报 issue | `npm test` → `normalizeState: 失败路径——顶层非对象…` / `字段畸形逐个丢弃并报 issue` | 已实测（2026-09-14） |
 
 ## 8 · 与实现的关系
 
@@ -129,10 +133,19 @@ agent/status(idle) → sessionProjections.snapshot(agent.session).values.tokenUs
 - 2026-09-14 补课：本插件此前无语义文档（可维护性工程）
 - 2026-09-14 本文首版（draft）：10 节结构 + 调用点清单 + 可证伪验收清单；全部事实从源码与只读取证读出，未验证项显式标「待验收」
 - 2026-09-14 复核补正（队长验收回写）：§10 第 5 条由「未决」升为**已证事实**——官方 `@deepseek-ai/dsh-llm-retry` 经 `@deepseek-ai/dsh-base` bundle 挂载（`packages/bundle/base/cordis.patch.yml:84-85`），组合真源在 bundle 层而非 profile patch；同步在 §7 增第 10 条验收行。教训：**「patch 里没有」不等于「组合里没有」**——判组合真源要追到 bundle/依赖面。
+- **2026-09-14 · 可维护性补课（S3 有测试 / S6 失败路径）：抽两个纯逻辑模块 + 修两处提示不一致**
+  - **抽层（行为不变的搬家）**：新增 `src/retry-pure.ts`（`DEFAULT_RETRYABLE_CODES` / `buildPolicy` / `decidePolicyUpgrade`——原来写在 `apply()` 的 `agent/request-error` 监听器里）与 `src/budget-pure.ts`（`normalizeState` / `isLegacyState` / `usageTotalOf` / `effectiveBudget` / `totalSpent` / `contributionOf` / `maxRemindPercent` / `dueReminders` / `cycleResetDue` / `remindText` / `splitSpentByActive` / `budgetStatus`）。`index.ts` 与 `budget.ts` 只留接线：读 payload/write payload/`next()`、fs、ctx、`new Date()`。决策句法 1:1 保留。
+  - **真缺陷 ①（修前已证伪 · 静态尸体）**：会话插话提醒写 `remindText(lastPercent, totalSpent(), **config.budgetTokens**)`——阈值按 `effectiveBudget()`（`token_budget_set` 的**运行态**预算）判定，文案却印**配置里的旧预算**：同一条消息里两个预算。守卫 `tests/contract.test.mjs` 不变量② 抓到；尸体样本 = 修前那一行原样喂入检测器必须判违规（已实测）。
+  - **真缺陷 ②（同处一并修）**：插话文案的档位取 `config.remindAtPercent` **末位**（标注 100%），而实际可能是 50% 档触发——文案谎报档位。改为用**本次实际触发的最高档位**（`record()` 的返回值由 `boolean` 改为 `number[]`——`dueReminders` 直接给出触发档位列表，`if (fired)` → `if (fired.length > 0)`）。
+  - **行为变更（显式列出）**：① 插话提醒文案中的预算数字由 `config.budgetTokens` 改为**生效预算**；② 插话提醒文案的档位由「配置末位档位」改为「本次实际触发的最高档位」；③ `normalizeState` 对**畸形** state 字段（`sessions`/`baseline` 非对象、`reminded` 非数组、数值非有限）由「带着坏值继续算（可产出 NaN/字符串拼接）」改为「丢弃该字段 + 报 issue」，**合法 state 语义逐条不变**。三者都只影响提示文案与损坏输入的处置，不影响阈值判定与记账。
+  - **语义被补充（新不变量 ①）**：`agent/request-error` 监听器**必须无条件放行**——回调体末条语句必须是 `return next()`（任何分支吞掉放行 = 官方执行器永不运行 = 重试静默消失）。由 `tests/contract.test.mjs` 静态守卫 + 尸体样本锁住。
+  - **语义被补充（新不变量 ②）**：`remindText` 的预算参数必须与判定阈值**同源**（都是 `effective()`）。
+  - **闭环**：§10 第 1 条（注释误写上游默认 `maxRetries=2`）已订正为 `5`（`@deepseek-ai/dsh-llm` 的 `retry-policy.ts` `DEFAULT_MAX_RETRIES`）。
+  - **教训**：`.mjs` 测试里写 `as string` 直接 `SyntaxError`（纯 JS 无类型断言）；路径/数值断言要按真实语义现算，别硬编码作者一侧的字面量。
 
 ## 10 · 未决问题
 
-1. **上游默认重试次数与源码注释不符**：`src/index.ts:7` 注释称「provider 未配置 retryPolicy 时解析出默认 `maxRetries=2`」，但上游 `retry-policy.ts:14` 的 `DEFAULT_MAX_RETRIES = 5`（`2` 只出现在测试夹具里）。注释需订正——升级阈值判断（`< config.maxRetries`）不受影响，但「为什么需要升级」的叙事要改。
+1. **上游默认重试次数与源码注释不符** → **已解决（2026-09-14）**：注释已订正为上游真实默认 `maxRetries=5`（`@deepseek-ai/dsh-llm` `retry-policy.ts` `DEFAULT_MAX_RETRIES = 5`；`2` 只出现在测试夹具里）。升级阈值判断（`< config.maxRetries`）不受影响；「为什么需要升级」的叙事同步改为「5 次对一次失败就接近放弃的场景仍太少」。
 2. **升级是否真的发生无留痕**：`llm_retry_status` 的 `upgraded` 只是**插件配置的镜像**，不是「本次请求实际用了什么」；升级路径只有 `ctx.logger.info`（不落盘），无法事后证明某次失败被升过级。按 §5.22 应补侧车轨迹（如 `<DSH_HOME>/llm-retry-trace.jsonl`：`atMs/provider/code/from→to`）。
 3. **依赖私有字段**：`llm_retry_status` 读 `LlmRuntime.adapters`（private，经 `any`）；上游字段改名即静默退化为空 `providers`（`catch {}` 吞错）——需要一条「读不到要响亮」的判据。
 4. **backoff 覆盖语义**：本插件把 `initialDelayMs/maxDelayMs/jitterRatio` 一并写进新策略（不保留 provider 原 `backoff`）；若某 provider 显式配了激进退避，升级会**覆盖**它——有意还是疏漏，未定。
@@ -140,3 +153,6 @@ agent/status(idle) → sessionProjections.snapshot(agent.session).values.tokenUs
 6. **预算路径当前为死路径**：web 配置 `budgetEnabled: false`，`applyBudget` 不执行，3 个 `token_budget_*` 工具在线上不可见——保留还是改由开关按需启用，待定。
 7. **`remindCooldownMs` 未被使用**：配置存在、代码无引用（档位去重靠 `reminded` 数组，足够）——遗留字段还是待接线，未定。
 8. **原 dsh-agent-token-budget 仓库**：合并后是否归档，未处理。
+9. **监听器/记账的 ctx 级集成仍未测**（新，2026-09-14）：决策层已有单测、接线层有静态守卫，但「构造假 payload 调监听器 → 断言 payload 被改写且 next() 被调」与「造假 ctx 跑 applyBudget → 断言 persist 落盘」两条集成用例仍缺（需要 ctx 桩）。补法：抽一个最小 ctx 桩（logger/on/tools.register/effect 四个口）再补两条集成用例。
+10. **`Record` 返回值的语义边界**（新，2026-09-14）：`record()` 现在返回「本次触发的档位数组」，调用方用 `Math.max(...fired)` 播报。若配置里出现重复档位（如 `[50, 50]`），`dueReminders` 会返回两个 50（`reminded.includes` 只在已记录时去重）——是否去重未定调；当前判定为「配置重复属配置错误，不额外兜底」。
+11. **`budget-pure.ts` 的 `TokenUsageLike` 与上游 `TokenUsageProjection` 平行维护**（新，2026-09-14）：`usageTotalOf` 取 `unknown` 入参以容忍坏快照，代价是丢掉了上游类型约束——上游改桶名（如新增第五桶）时这里**不会**编译报错。判据：记账口径变更必须同步本文件与 §3 概念模型。

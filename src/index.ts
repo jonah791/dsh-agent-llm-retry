@@ -4,7 +4,9 @@
  * 背景（2026-08-19 主人需求）：
  * - 官方 @deepseek-ai/dsh-llm-retry 是重试执行器（指数退避 + jitter + durable llm/retry 事件），
  *   但官方组合从未挂载它——模型请求失败没有任何自动重试
- * - provider 未配置 retryPolicy 时，dsh-llm 解析出默认 maxRetries=2（太少，一次失败就接近放弃）
+ * - provider 未配置 retryPolicy 时，dsh-llm 解析出默认 maxRetries=5（`@deepseek-ai/dsh-llm` 的
+ *   `retry-policy.ts` `DEFAULT_MAX_RETRIES = 5`；早前注释写 2 是错的——2 只出现在测试夹具里，
+ *   2026-09-14 订正，见 docs/semantic.md §10 第 1 条），对「一次失败就接近放弃」的场景仍太少
  * - 本插件在 agent/request-error 扩展点 **prepend** 注册：把 normal 策略升级为 maxRetries=20（默认），
  *   官方执行器（patch 挂载）随后用升级后的策略执行重试
  *
@@ -17,6 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { applyBudget, Config as BudgetConfigSchema } from './budget.ts'
+import { decidePolicyUpgrade, type RetryPolicy, type RetryPolicyNormal } from './retry-pure.ts'
 
 export const name = 'agent-llm-retry'
 export const inject = ['tools', 'llm', 'sessionProjections', 'sessions'] as const
@@ -44,35 +47,12 @@ export const Config = z.object({
   budgetEnabled: z.boolean().default(true),
 })
 
-/** 官方默认可重试错误码（与 dsh-llm 一致） */
-const DEFAULT_RETRYABLE_CODES = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']
-
-interface RetryPolicyNormal {
-  mode: 'normal'
-  maxRetries: number
-  retryableCodes: readonly string[]
-  initialDelayMs: number
-  maxDelayMs: number
-  jitterRatio: number
-}
-
-function buildPolicy(config: Config, retryableCodes: readonly string[]): RetryPolicyNormal {
-  return {
-    mode: 'normal',
-    maxRetries: config.maxRetries,
-    retryableCodes,
-    initialDelayMs: config.initialDelayMs,
-    maxDelayMs: config.maxDelayMs,
-    jitterRatio: config.jitterRatio,
-  }
-}
-
 interface RequestErrorPayload {
   turn?: number
   step?: number
   provider?: string
   failure?: { code?: string; message?: string }
-  retryPolicy?: RetryPolicyNormal | { mode: 'always' } | undefined
+  retryPolicy?: RetryPolicy | undefined
   signal?: AbortSignal
 }
 
@@ -81,19 +61,15 @@ export function apply(ctx: Context, config: Config): void {
 
   // ---------- ① 策略升级器（prepend：先于官方 llm-retry 执行器运行） ----------
   // payload 用宽松类型：agent/request-error 的注入类型带 readonly 约束，运行时防御已足够
+  // 决策（inject/upgrade/noop）在 src/retry-pure.ts，可离线单测；这里只做读 payload → 写 payload → 放行
   ctx.on('agent/request-error', async (payload: any, next) => {
-    const policy = payload?.retryPolicy as RetryPolicyNormal | { mode: 'always' } | undefined
+    const policy = payload?.retryPolicy as RetryPolicy | undefined
     const provider = payload?.provider ?? '?'
     const code = payload?.failure?.code ?? '?'
-    if (policy === undefined) {
-      // 防御性注入（llm 正常总会给默认策略，此分支理论不触发）
-      payload.retryPolicy = buildPolicy(config, [...DEFAULT_RETRYABLE_CODES])
-      logger.info('注入默认 retryPolicy maxRetries=' + config.maxRetries + ' provider=' + provider + ' code=' + code)
-    } else if (policy.mode === 'normal' && policy.maxRetries < config.maxRetries) {
-      // 默认 2 次或显式较小值 → 升级到 maxRetries（保留原可重试码；无则用官方默认）
-      const codes = Array.isArray(policy.retryableCodes) && policy.retryableCodes.length > 0 ? policy.retryableCodes : DEFAULT_RETRYABLE_CODES
-      payload.retryPolicy = buildPolicy(config, [...codes])
-      logger.info('策略升级 maxRetries ' + String(policy.maxRetries) + '→' + config.maxRetries + ' provider=' + provider + ' code=' + code)
+    const decision = decidePolicyUpgrade(policy, config)
+    if (decision.action !== 'noop' && decision.policy !== undefined) {
+      payload.retryPolicy = decision.policy as RetryPolicyNormal
+      logger.info(decision.reason + ' provider=' + provider + ' code=' + code)
     }
     // always 模式 / 已 ≥ maxRetries 的策略：不动；无条件放行官方执行器
     return next()

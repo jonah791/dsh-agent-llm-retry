@@ -26,8 +26,12 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection'
-import type { TokenUsageProjection } from '@deepseek-ai/dsh-token-meter'
 import type {} from '@deepseek-ai/dsh-session'
+import {
+  budgetStatus, contributionOf, cycleResetDue, dueReminders, effectiveBudget, emptyBudgetState,
+  isLegacyState, maxRemindPercent, normalizeState, remindText, totalSpent, usageTotalOf,
+  type BudgetState,
+} from './budget-pure.ts'
 
 export const budgetName = 'agent-token-budget'
 export const budgetInject = ['sessionProjections', 'tools', 'sessions'] as const
@@ -50,54 +54,21 @@ export const Config = z.object({
 // ---------- 持久化 ----------
 const defaultStateFile = (): string => join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'token-budget.json')
 
-interface BudgetState {
-  /** 周期内累计：sessionId → 该会话自周期起点（或首次出现）以来的增量贡献 */
-  sessions: Record<string, number>
-  /** 周期基线：sessionId → 该会话首次记账时的绝对用量（周期起点/新会话起点） */
-  baseline: Record<string, number>
-  /** 触发过的档位（percent），防重复提醒 */
-  reminded: number[]
-  /** 运行态预算（token_budget_set 动态设定）；0=未设定，回落到 config.budgetTokens */
-  budgetTokens: number
-  /** 周期序号（清零计数） */
-  cycle: number
-  /** 本周期开始时间 */
-  cycleStartedAt: string
-  updatedAt: string
-}
-
-const EMPTY_USAGE: TokenUsageProjection = {
-  uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
-}
-
-/** 提取投影快照中的 tokenUsage 合计 */
-function usageTotalOf(snapshot: ProjectionSnapshot): number {
-  const usage = snapshot.values.tokenUsage ?? EMPTY_USAGE
-  return usage.uncachedInputTokens + usage.cacheReadTokens + usage.cacheWriteTokens + usage.outputTokens
-}
-
 export function applyBudget(ctx: Context, config: Config): void {
   const logger = ctx.logger('dsh-agent-token-budget')
   const path = config.stateFile ?? defaultStateFile()
 
-  let state: BudgetState = { sessions: {}, baseline: {}, reminded: [], budgetTokens: 0, cycle: 0, cycleStartedAt: '', updatedAt: '' }
+  let state: BudgetState = emptyBudgetState()
   try {
     if (existsSync(path)) {
-      const saved = JSON.parse(readFileSync(path, 'utf8')) as Partial<BudgetState>
-      state = {
-        sessions: saved.sessions ?? {},
-        baseline: saved.baseline ?? {},
-        reminded: saved.reminded ?? [],
-        budgetTokens: saved.budgetTokens ?? 0,
-        cycle: saved.cycle ?? 0,
-        cycleStartedAt: saved.cycleStartedAt ?? '',
-        updatedAt: saved.updatedAt ?? '',
-      }
+      const loaded = normalizeState(JSON.parse(readFileSync(path, 'utf8')) as unknown)
+      state = loaded.state
+      for (const issue of loaded.issues) logger.warn('state 载入告警: ' + issue)
     }
   } catch (e) { logger.warn('state 载入失败: ' + String(e)) }
   // 旧格式迁移（2026-08-18 周期模型）：旧数据是全量绝对量（含死会话 5.6 亿虚高），
   // 无法还原基线——按「未输入预算」处理：清零统计，等待主人 token_budget_set 输入预算开新周期
-  if (Object.keys(state.sessions).length > 0 && Object.keys(state.baseline).length === 0) {
+  if (isLegacyState(state)) {
     state.sessions = {}
     state.baseline = {}
     state.reminded = []
@@ -113,10 +84,7 @@ export function applyBudget(ctx: Context, config: Config): void {
   }
 
   // 有效预算：运行态设定优先，否则回落配置；<=0 = 未输入预算（不统计）
-  const effectiveBudget = (): number => state.budgetTokens > 0 ? state.budgetTokens : (config.budgetTokens > 0 ? config.budgetTokens : 0)
-
-  // 累计总额（周期内各会话增量贡献之和）
-  const totalSpent = (): number => Object.values(state.sessions).reduce((a, b) => a + (b ?? 0), 0)
+  const effective = (): number => effectiveBudget(state.budgetTokens, config.budgetTokens)
 
   // 开启新周期：累计清零 + 档位重置 + 基线清空（后续记账从新起点增量）
   const startNewCycle = (note: string): void => {
@@ -131,53 +99,34 @@ export function applyBudget(ctx: Context, config: Config): void {
 
   // 活跃会话判定：当前 sessions store 已加载的会话 = 活跃（其余为历史/失效）
   const activeSessionIds = (): Set<string> => new Set((ctx as Context & { sessions?: { list(): { id: string }[] } }).sessions?.list().map((s) => s.id) ?? [])
-  // 用量分解：活跃 vs 历史
-  const splitSpent = (): { active: number; stale: number; activeCount: number; staleCount: number } => {
-    const active = activeSessionIds()
-    let activeSum = 0, staleSum = 0, activeCount = 0, staleCount = 0
-    for (const [sid, v] of Object.entries(state.sessions)) {
-      if (active.has(sid)) { activeSum += v ?? 0; activeCount += 1 } else { staleSum += v ?? 0; staleCount += 1 }
-    }
-    return { active: activeSum, stale: staleSum, activeCount, staleCount }
-  }
-  const remindText = (percent: number, spent: number, budget: number): string =>
-    '【Token 预算提醒】已用 ' + (spent / 1e6).toFixed(1) + 'M / ' + (budget / 1e6).toFixed(0) + 'M'
-    + '（' + percent + '%）——主人批的预算快用完啦，注意规划接下来的动作 (´▽｀)'
 
-  // 更新某会话记账并检查阈值；返回是否触发提醒。
+  // 更新某会话记账并检查阈值；返回**本次触发的档位**（空数组 = 未触发）。
   // 周期语义（主人 2026-08-18 定调）：只有输入预算后才统计；提醒完毕（最高档触发）后累计清零
-  const record = (sessionId: string, usageTotal: number): boolean => {
-    const budget = effectiveBudget()
-    if (budget <= 0) return false // 未输入预算：不统计
+  const record = (sessionId: string, usageTotal: number): number[] => {
+    const budget = effective()
+    if (budget <= 0) return [] // 未输入预算：不统计
     // 基线：新会话首次记账时定格绝对用量，之后只记增量（周期起点后的新消耗）
     if (!(sessionId in state.baseline)) {
       state.baseline[sessionId] = usageTotal
       state.sessions[sessionId] = 0
     }
-    const contribution = Math.max(0, usageTotal - (state.baseline[sessionId] ?? usageTotal))
+    const contribution = contributionOf(usageTotal, state.baseline[sessionId] ?? usageTotal)
     if (contribution !== state.sessions[sessionId]) {
       state.sessions[sessionId] = contribution
       persist()
     }
-    const spent = totalSpent()
-    let fired = false
-    const maxPercent = Math.max(...config.remindAtPercent.filter((p) => p > 0), 0)
-    for (const percent of config.remindAtPercent) {
-      if (percent <= 0) continue
-      if (state.reminded.includes(percent)) continue
-      const threshold = Math.round(budget * percent / 100)
-      if (spent >= threshold) {
+    const spent = totalSpent(state.sessions)
+    const fired = dueReminders({ spent, budget, remindAtPercent: config.remindAtPercent, reminded: state.reminded })
+    if (fired.length > 0) {
+      for (const percent of fired) {
         state.reminded.push(percent)
-        fired = true
-        const text = remindText(percent, spent, budget)
         logger.info('remind ' + percent + '% spent=' + spent + ' cycle=' + state.cycle)
-        void notifyTelegram(text)
+        void notifyTelegram(remindText(percent, spent, budget))
       }
-    }
-    if (fired) {
       persist()
       // 最高档提醒完毕：累计清零，开新周期（主人定调「提醒完毕之后累计清零」）
-      if (maxPercent > 0 && spent >= Math.round(budget * maxPercent / 100)) {
+      const maxPercent = maxRemindPercent(config.remindAtPercent)
+      if (cycleResetDue(spent, budget, maxPercent)) {
         startNewCycle('最高档 ' + maxPercent + '% 提醒完毕，自动清零开新周期')
       }
     }
@@ -207,13 +156,15 @@ export function applyBudget(ctx: Context, config: Config): void {
       const snapshot = projections.snapshot(agent.session)
       const usageTotal = usageTotalOf(snapshot)
       const fired = record(agent.id, usageTotal)
-      // 插话提醒（达档位时在会话里也提示主人）
-      if (fired) {
-        const lastPercent = config.remindAtPercent[config.remindAtPercent.length - 1] ?? 100
+      // 插话提醒（达档位时在会话里也提示主人）：用**实际触发的最高档位**与**生效预算**，
+      // 与 telegram 文本同源（修前此处固定取 config.remindAtPercent 末位 + config.budgetTokens，
+      // 会出现「弹 50% 档却写 100%」「显示配置预算而非 token_budget_set 的预算」）
+      if (fired.length > 0) {
+        const percent = Math.max(...fired)
         try {
           agent.send(
             createUserMessage({
-              content: [{ type: 'text', text: remindText(lastPercent, totalSpent(), config.budgetTokens) }],
+              content: [{ type: 'text', text: remindText(percent, totalSpent(state.sessions), effective()) }],
               source: { kind: 'plugin', plugin: 'dsh-agent-token-budget' },
             }),
             'next-turn',
@@ -234,23 +185,7 @@ export function applyBudget(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: (v.tracking ? '周期#' + v.cycle + ' 已用 ' + (v.spentTokens / 1e6).toFixed(1) + 'M / ' + (v.budgetTokens / 1e6).toFixed(0) + 'M (' + v.percentUsed + '%) 活跃=' + (v.activeSpent / 1e6).toFixed(1) + 'M 历史=' + (v.staleSpent / 1e6).toFixed(1) + 'M 会话=' + v.sessionsTracked + ' 提醒=' + JSON.stringify(v.reminded) : '未输入预算（未统计）——请用 token_budget_set 输入预算后开始统计') }],
     },
     async execute() {
-      const budget = effectiveBudget()
-      const spent = totalSpent()
-      const split = splitSpent()
-      return {
-        ok: true,
-        tracking: budget > 0,
-        spentTokens: spent,
-        budgetTokens: budget,
-        remainingTokens: Math.max(0, budget - spent),
-        percentUsed: budget > 0 ? Math.round(spent / budget * 10000) / 100 : 0,
-        sessionsTracked: Object.keys(state.sessions).length,
-        activeSpent: split.active,
-        staleSpent: split.stale,
-        cycle: state.cycle,
-        cycleStartedAt: state.cycleStartedAt,
-        reminded: [...state.reminded],
-      }
+      return budgetStatus({ state, configBudget: config.budgetTokens, activeIds: activeSessionIds() }) as never
     },
   }))
 
@@ -319,6 +254,6 @@ export function applyBudget(ctx: Context, config: Config): void {
 
   // 启动时打印一次状态（便于诊断）
   ctx.effect(function* () {
-    logger.info('token-budget ready: budget=' + effectiveBudget() + ' tracking=' + (effectiveBudget() > 0) + ' cycle=' + state.cycle + ' tracked=' + Object.keys(state.sessions).length + ' spent=' + totalSpent())
+    logger.info('token-budget ready: budget=' + effective() + ' tracking=' + (effective() > 0) + ' cycle=' + state.cycle + ' tracked=' + Object.keys(state.sessions).length + ' spent=' + totalSpent(state.sessions))
   }, 'agent-token-budget lifecycle')
 }
