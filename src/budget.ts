@@ -33,6 +33,12 @@ import {
   type BudgetState,
 } from './budget-pure.ts'
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-token-budget': { kind: 'dsh-agent-token-budget' }
+  }
+}
+
 export const budgetName = 'agent-token-budget'
 export const budgetInject = ['sessionProjections', 'tools', 'sessions'] as const
 
@@ -165,7 +171,7 @@ export function applyBudget(ctx: Context, config: Config): void {
           agent.send(
             createUserMessage({
               content: [{ type: 'text', text: remindText(percent, totalSpent(state.sessions), effective()) }],
-              source: { kind: 'plugin', plugin: 'dsh-agent-token-budget' },
+              source: { kind: 'dsh-agent-token-budget' },
             }),
             'next-turn',
             true,
