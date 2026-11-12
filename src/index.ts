@@ -78,6 +78,7 @@ export function apply(ctx: Context, config: Config): void {
   // ---------- ② 状态工具：查看各 provider 的 retryPolicy 解析结果 ----------
   ctx.tools.register(defineTool({
     name: 'llm_retry_status',
+    deferLoading: true,
     description: '查看模型请求重试策略状态：各 provider 的 retryPolicy 解析结果（maxRetries/可重试错误码/退避参数）——诊断自动重试是否按预期生效',
     parameters: {},
     output: {

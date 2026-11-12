@@ -184,6 +184,7 @@ export function applyBudget(ctx: Context, config: Config): void {
   // ---------- 工具：token_budget_status（周期模式） ----------
   ctx.tools.register(defineTool({
     name: 'token_budget_status',
+    deferLoading: true,
     description: '查询 Token 预算状态（周期模式）：本周期累计已用、预算、剩余、档位提醒、活跃/历史会话分解、周期号。只有输入预算后（token_budget_set 或配置）才统计；提醒完毕自动清零开新周期。',
     parameters: {},
     output: {
@@ -198,6 +199,7 @@ export function applyBudget(ctx: Context, config: Config): void {
   // ---------- 工具：token_budget_set（输入预算 → 开始统计） ----------
   ctx.tools.register(defineTool({
     name: 'token_budget_set',
+    deferLoading: true,
     description: '输入/更新 Token 预算并开新统计周期（主人定调：只有输入预算后才统计）。执行后累计清零、档位重置，从当下起统计各会话增量消耗；预算保留到再次 set。',
     parameters: {
       budgetTokens: { type: 'number', description: '预算总额（tokens，>0；如 500000000 = 5 亿）', required: true },
@@ -219,6 +221,7 @@ export function applyBudget(ctx: Context, config: Config): void {
   // ---------- 工具：token_budget_reset（手动清零/清理） ----------
   ctx.tools.register(defineTool({
     name: 'token_budget_reset',
+    deferLoading: true,
     description: '清零 Token 预算统计：scope=all 开新周期（累计清零）；scope=session 删除指定会话统计；scope=stale 清理已不在活跃列表的死会话统计（历史虚高一键清理）。预算额保留。',
     parameters: {
       scope: { type: 'string', description: 'all=全部清零开新周期 / session=指定会话 / stale=清理死会话', required: true },
